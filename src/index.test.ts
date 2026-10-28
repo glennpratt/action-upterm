@@ -123,6 +123,10 @@ function baselineInputs(): void {
   when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('');
   when(core.getInput).calledWith('upterm-version').mockReturnValue('');
   when(core.getInput).calledWith('detached').mockReturnValue('false');
+  when(core.getInput).calledWith('inherit-path').mockReturnValue('false');
+  when(core.getInput).calledWith('default-shell').mockReturnValue('');
+  when(core.getInput).calledWith('github-token').mockReturnValue('');
+  when(core.getInput).calledWith('wait-for-session').mockReturnValue('');
 }
 
 /**
@@ -1351,6 +1355,247 @@ describe('upterm GitHub integration', () => {
       when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('renovate[bot]');
       await run();
       expect(launchCall()).toContain("--authorized-user 'github:renovate[bot]'");
+    });
+  });
+
+  describe('hosted shell', () => {
+    const launchCall = () => mockedExecShellCommand.mock.calls.map(c => c[0]).find(c => c.includes('upterm host'));
+
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      fsWithoutExitFiles();
+      baselineShell(readySession(), endedResponse);
+    });
+
+    it('with inherit-path, hosts a bash that reads no startup files, so nothing resets PATH', async () => {
+      when(core.getInput).calledWith('inherit-path').mockReturnValue('true');
+      await run();
+      expect(launchCall()).toMatch(/ -- \/bin\/bash --noprofile --norc -i$/);
+    });
+
+    it('places --join-timeout before the hosted bash, so bash never sees it', async () => {
+      when(core.getInput).calledWith('inherit-path').mockReturnValue('true');
+      when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
+      await run();
+      expect(launchCall()).toMatch(/ --join-timeout 5m -- \/bin\/bash --noprofile --norc -i$/);
+    });
+
+    it('hosts default-shell over inherit-path', async () => {
+      when(core.getInput).calledWith('inherit-path').mockReturnValue('true');
+      when(core.getInput).calledWith('default-shell').mockReturnValue(' /opt/env/bin/bash ');
+      await run();
+      expect(launchCall()).toMatch(/ -- '\/opt\/env\/bin\/bash'$/);
+    });
+
+    it('hosts default-shell on Windows too, instead of login bash', async () => {
+      Object.defineProperty(process, 'platform', {value: 'win32'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+      when(core.getInput).calledWith('default-shell').mockReturnValue('/usr/bin/zsh');
+      await run();
+      expect(launchCall()).toMatch(/ -- '\/usr\/bin\/zsh'$/);
+    });
+
+    it('keeps MSYS2 login bash on Windows with inherit-path', async () => {
+      Object.defineProperty(process, 'platform', {value: 'win32'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+      when(core.getInput).calledWith('inherit-path').mockReturnValue('true');
+      await run();
+      expect(launchCall()).toMatch(/ -- bash -l$/);
+    });
+  });
+
+  describe('GitHub Enterprise Server', () => {
+    const launchCall = () => mockedExecShellCommand.mock.calls.map(c => c[0]).find(c => c.includes('upterm host'));
+    const originalServerUrl = process.env.GITHUB_SERVER_URL;
+    let paginate: jest.Mock;
+
+    function keysFor(byUser: Record<string, string[] | Error>): void {
+      paginate.mockImplementation(async (_route: unknown, {username}: {username: string}) => {
+        const keys = byUser[username];
+        if (keys instanceof Error) throw keys;
+        return (keys ?? []).map(key => ({key}));
+      });
+    }
+
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      fsWithoutExitFiles();
+      baselineShell(readySession(), endedResponse);
+      process.env.GITHUB_SERVER_URL = 'https://ghe.example.com';
+      when(core.getInput).calledWith('limit-access-to-users').mockReturnValue('alice,bob');
+      when(core.getInput).calledWith('github-token').mockReturnValue('ghs_token');
+      paginate = jest.fn();
+      require('@actions/github').getOctokit.mockReturnValue({paginate, rest: {users: {listPublicKeysForUser: 'listPublicKeysForUser'}}});
+    });
+
+    afterEach(() => {
+      if (originalServerUrl === undefined) delete process.env.GITHUB_SERVER_URL;
+      else process.env.GITHUB_SERVER_URL = originalServerUrl;
+    });
+
+    it("fetches each user's keys with github-token and hands upterm an authorized_keys file", async () => {
+      keysFor({alice: ['ssh-ed25519 AAAAalice'], bob: ['ssh-rsa AAAAbob1', 'ssh-ed25519 AAAAbob2']});
+      await run();
+
+      expect(require('@actions/github').getOctokit).toHaveBeenCalledWith('ghs_token');
+      expect(mockFs.writeFileSync).toHaveBeenCalledWith(
+        path.join(UPTERM_DATA_DIR, 'config', 'authorized_keys'),
+        'ssh-ed25519 AAAAalice alice@ghe.example.com\nssh-rsa AAAAbob1 bob@ghe.example.com\nssh-ed25519 AAAAbob2 bob@ghe.example.com\n',
+        {mode: 0o600}
+      );
+      const cmd = launchCall() as string;
+      expect(cmd).toMatch(/--authorized-keys '[^']*\/config\/authorized_keys'/);
+      expect(cmd).not.toContain('--authorized-user');
+      // Never on the command line, where the debug log would print it.
+      expect(cmd).not.toContain('ghs_token');
+    });
+
+    it('fails without launching when a user has no keys, rather than authorize only the rest', async () => {
+      keysFor({alice: ['ssh-ed25519 AAAAalice'], bob: []});
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('bob: no public SSH keys on ghe.example.com'));
+      expect(launchCall()).toBeUndefined();
+    });
+
+    it('fails without launching when a lookup fails', async () => {
+      keysFor({alice: new Error('Not Found'), bob: ['ssh-rsa AAAAbob']});
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('alice: Error: Not Found'));
+      expect(launchCall()).toBeUndefined();
+    });
+
+    it('without a token, names the instance in --authorized-user and warns', async () => {
+      when(core.getInput).calledWith('github-token').mockReturnValue('');
+      const {GITHUB_TOKEN, GH_TOKEN} = process.env;
+      delete process.env.GITHUB_TOKEN;
+      delete process.env.GH_TOKEN;
+      try {
+        await run();
+      } finally {
+        if (GITHUB_TOKEN !== undefined) process.env.GITHUB_TOKEN = GITHUB_TOKEN;
+        if (GH_TOKEN !== undefined) process.env.GH_TOKEN = GH_TOKEN;
+      }
+
+      const cmd = launchCall() as string;
+      expect(cmd).toContain("--authorized-user 'github:alice@ghe.example.com'");
+      expect(cmd).toContain("--authorized-user 'github:bob@ghe.example.com'");
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('No github-token for ghe.example.com'));
+    });
+
+    it('leaves github.com to upterm', async () => {
+      process.env.GITHUB_SERVER_URL = 'https://github.com';
+      await run();
+
+      expect(paginate).not.toHaveBeenCalled();
+      expect(launchCall()).toContain("--authorized-user 'github:alice'");
+    });
+  });
+
+  describe('wait step', () => {
+    const handoff = {
+      name: 'gha-3f9a1c05',
+      xdg: {runtime: '/rt', state: '/state', config: '/config'},
+      continueFilesAtLaunch: {'/continue': 1000},
+      message: 'SSH: ssh user@session123.upterm.dev'
+    };
+
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      when(core.getInput).calledWith('wait-for-session').mockReturnValue('true');
+      when(core.getInput).calledWith('timeout-minutes').mockReturnValue('');
+      process.env.UPTERM_ACTION_DETACHED_SESSION = JSON.stringify(handoff);
+    });
+
+    afterEach(() => {
+      delete process.env.UPTERM_ACTION_DETACHED_SESSION;
+      jest.restoreAllMocks();
+    });
+
+    it('detached mode hands the wait step its session, XDG directories, launch snapshot and message', async () => {
+      delete process.env.UPTERM_ACTION_DETACHED_SESSION;
+      when(core.getInput).calledWith('wait-for-session').mockReturnValue('');
+      when(core.getInput).calledWith('detached').mockReturnValue('true');
+      fsWithoutExitFiles();
+      continueFiles({'/continue': 42});
+      baselineShell(readySession());
+
+      await run();
+
+      const [name, value] = core.exportVariable.mock.calls.find(c => c[0] === 'UPTERM_ACTION_DETACHED_SESSION') ?? [];
+      expect(name).toBe('UPTERM_ACTION_DETACHED_SESSION');
+      const exported = JSON.parse(value as string);
+      expect(exported.name).toMatch(/^gha-[0-9a-f]{8}$/);
+      expect(exported.xdg.runtime).toBe(process.env.XDG_RUNTIME_DIR);
+      expect(exported.xdg.state).toBe(process.env.XDG_STATE_HOME);
+      expect(exported.continueFilesAtLaunch['/continue']).toBe(42);
+      expect(exported.message).toContain('ssh user@session123.upterm.dev');
+    });
+
+    it('does nothing when no detached session was started in the job', async () => {
+      delete process.env.UPTERM_ACTION_DETACHED_SESSION;
+      await run();
+
+      expect(mockedExecShellCommand).not.toHaveBeenCalled();
+      expect(core.setFailed).not.toHaveBeenCalled();
+    });
+
+    it("waits on the main step's session, in its directories, until it ends - and never launches or stops one", async () => {
+      continueFiles({});
+      baselineShell(readySession(), endedResponse);
+
+      await run();
+
+      const cmds = mockedExecShellCommand.mock.calls.map(c => c[0]);
+      expect(cmds.filter(c => c.includes("session info 'gha-3f9a1c05'")).length).toBe(2);
+      expect(cmds.some(c => c.includes('upterm host') || c.includes('session stop') || c.includes('session set'))).toBe(false);
+      expect(process.env.XDG_RUNTIME_DIR).toBe('/rt');
+      expect(process.env.XDG_STATE_HOME).toBe('/state');
+      expect(core.saveState).not.toHaveBeenCalled();
+      expect(core.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('releases on a continue file touched since the launch, leaving the session running', async () => {
+      continueFiles({'/continue': 2000});
+      baselineShell(readySession());
+
+      await run();
+
+      expect(core.info).toHaveBeenCalledWith("Exiting debugging session because '/continue' file was created");
+      expect(sessionInfoCalls()).toBe(0);
+    });
+
+    it('ignores a continue file unchanged since the launch', async () => {
+      continueFiles({'/continue': 1000});
+      baselineShell(readySession(), endedResponse);
+
+      await run();
+
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('it was there before this session started'));
+      expect(sessionInfoCalls()).toBe(2);
+    });
+
+    it('stops waiting after timeout-minutes, and says the session is still running', async () => {
+      when(core.getInput).calledWith('timeout-minutes').mockReturnValue('1');
+      continueFiles({});
+      baselineShell(readySession());
+      jest
+        .spyOn(Date, 'now')
+        .mockReturnValueOnce(0)
+        .mockReturnValue(60_000 + 1);
+
+      await run();
+
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('after 1 minute(s); it is still running'));
+      expect(core.setFailed).not.toHaveBeenCalled();
+    });
+
+    it('rejects a timeout-minutes that is not a positive integer', async () => {
+      when(core.getInput).calledWith('timeout-minutes').mockReturnValue('0');
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith('timeout-minutes must be a positive integer');
     });
   });
 

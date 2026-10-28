@@ -37,6 +37,18 @@ inputs:
     description: "In detached mode, the workflow job will continue while the upterm session is active"
     required: false
     default: "true"
+  inherit-path:
+    description: "If true, the session hosts a bash that reads no startup files (/bin/bash --noprofile --norc -i), so the guest's shell keeps this step's PATH instead of having /etc/profile, ~/.bashrc or a container's init reset it. If false, upterm hosts $SHELL. Ignored on Windows, and when default-shell is set."
+    required: false
+    default: "true"
+  default-shell:
+    description: "Absolute path to the shell the session hosts. Use this when your container has a wrapper shell that sets up the real environment (e.g. /opt/env/bin/bash). Takes precedence over inherit-path."
+    required: false
+    default: ""
+  github-token:
+    description: "Token used on GitHub Enterprise Server to fetch the SSH keys of the users limit-access-to-actor and limit-access-to-users authorize, through the instance's API. Unused on github.com."
+    required: false
+    default: ${{ github.token }}
 outputs:
   ssh-command:
     description: "The SSH command to connect to the upterm session (e.g., 'ssh session:token@uptermd.upterm.dev')"

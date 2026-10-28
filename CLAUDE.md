@@ -25,13 +25,15 @@ See ARCHITECTURE.md for the full picture (the four `upterm` calls, the wait loop
 - `src/session.ts` - Session types and helpers: parses `upterm session info -o json`, `isNoSuchSession()` (upterm's exit 4), `hasGuestJoined()`, `waitStatusLine()`, `statusLabel()`, `tunnelDownLine()`, `outcomePending()` (an `ending` answer upterm hasn't yet said why for), `connectLines()` (the `Join:`/`SSH:` lines), the upterm version gate
 - `src/helpers.ts` - Contains `execShellCommand()` (runs every shell command through bash, `C:\msys64\usr\bin\bash.exe -lc` on Windows) and `shellEscape()`; a non-zero exit rejects with `ShellCommandError`, which carries `exitCode`
 - `action.yml` / `detached/action.yml` - GitHub Action metadata and input definitions (kept in sync by CI; the latter's `main`/`post` point at `../lib/index.js` and `detached` defaults to `"true"`)
+- `wait/action.yml` - The wait step: the same bundle (`main` only, no `post`), selected by its internal `wait-for-session: "true"` input
 
 ### Main Flow (src/index.ts `run()`)
+0. **Wait step** - `wait-for-session` routes to `runWaitStep()`: it reads the session detached mode exported in `UPTERM_ACTION_DETACHED_SESSION` (name, XDG dirs, continue-file snapshot, message), since one action cannot read another's state, and runs `waitForSession()` with a `timeout-minutes` deadline. It only observes; it never launches, stops or arms a session
 1. **Post-step detection** - `core.getState('isPost') === 'true'` routes straight to `runPost()` (teardown) instead of re-running main
 2. **Input validation** - `validateInputs()` checks `wait-timeout-minutes`, requires `upterm-server`, and rejects a custom server with no usable host key pin (`knownHostsFor()`) - deliberately before `installDependencies()`, so a misconfiguration fails before anything is downloaded; that ordering is pinned by a test and should not be undone by someone tidying the function
 3. **Install upterm** - `installDependencies()` downloads the platform binary; on Windows it's also copied into MSYS2's `/usr/bin` so it's on the hosted login shell's PATH
 4. **Version gate** - `assertSupportedUptermVersion()` refuses upterm `< v0.32.0`, including an unparseable version string
-5. **Start the session** - `launchSession()` runs `upterm host --detach --accept --output json --name gha-XXXXXXXX --known-hosts <path> --server <server> [--authorized-user github:NAME ...] [--join-timeout Nm, attached mode only] [-- bash -l on Windows]`; its JSON stdout is the ready session, so there is no separate readiness poll
+5. **Start the session** - `launchSession()` runs `upterm host --detach --accept --output json --name gha-XXXXXXXX --known-hosts <path> --server <server> [--authorized-user github:NAME ... | --authorized-keys <path> on GHES] [--join-timeout Nm, attached mode only] [-- <hosted command>]`. `hostedCommand()`: `default-shell` if set; else `bash -l` on Windows; else `/bin/bash --noprofile --norc -i` with `inherit-path`; else none (`$SHELL`). On GitHub Enterprise Server (`GITHUB_SERVER_URL` not github.com) `authorizationFlags()` fetches keys with `github-token` via Octokit and writes an authorized_keys file, so the token never enters the daemon's (and so the guests') environment; any user without keys fails the launch; its JSON stdout is the ready session, so there is no separate readiness poll
 6. **Detached or attached** - detached mode publishes the SSH command/notice and returns immediately, letting the job's remaining steps run; the post step then runs `armJoinTimeout()` (`upterm session set <name> --join-timeout Nm`, default 10) and the same wait loop. Attached mode calls the wait loop directly.
 7. **Wait** - `waitForSession()` polls `upterm session info` every 5s, logging the time left before upterm's join deadline, until a continue file is created or touched after the launch (one unchanged since the launch is a leftover and is ignored), the session reaches a terminal status, or upterm reports no such session (exit 4). upterm itself ends a session nobody joined; the wait never stops a session. The post step's teardown runs `upterm session stop <name>`.
 
@@ -68,6 +70,9 @@ See ARCHITECTURE.md for the full picture (the four `upterm` calls, the wait loop
 - `wait-timeout-minutes`: Join timeout: upterm ends the session if no guest has joined by then; in detached mode, it starts after all regular steps finish; unset or 0: no timeout attached, 10 minutes detached
 - `upterm-version`: Version/tag to install; requires v0.32.0 or newer
 - `detached`: If `true`, the workflow continues after the session starts, and the wait moves to the post step
+- `inherit-path`: Default `true`: host `/bin/bash --noprofile --norc -i` so startup files cannot reset the PATH the daemon passes on (Unix only)
+- `default-shell`: Shell to host instead, on any platform; takes precedence over `inherit-path`
+- `github-token`: Default `${{ github.token }}`; used only on GitHub Enterprise Server to fetch authorized users' keys
 
 ## Critical Implementation Details
 

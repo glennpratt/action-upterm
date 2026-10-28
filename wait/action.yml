@@ -1,0 +1,21 @@
+name: "Wait for upterm session"
+description: >-
+  Hold the job at this step until the detached upterm session started earlier
+  in the job by owenthereal/action-upterm/detached ends, so that inline cleanup
+  steps run after a debugging session instead of before it.
+author: "Owen Ou"
+branding:
+  icon: "terminal"
+  color: "purple"
+runs:
+  using: "node24"
+  main: "../lib/index.js"
+inputs:
+  timeout-minutes:
+    description: "Minutes to wait before letting the workflow continue. The session is left running; detached mode's post step still waits for it."
+    required: false
+    default: "120"
+  wait-for-session:
+    description: "Internal: selects the wait step in the shared bundle. Do not set."
+    required: false
+    default: "true"

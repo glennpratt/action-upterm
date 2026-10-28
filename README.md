@@ -58,6 +58,8 @@ On a re-run, `limit-access-to-actor` also authorizes whoever re-ran the job. Bot
 
 If your registered public SSH key differs from your default private SSH key, specify the path manually: `ssh -i <path-to-private-key> <upterm-connection-string>`.
 
+On GitHub Enterprise Server, the users are looked up on the instance the workflow runs on, not on github.com. The action fetches their keys through the instance's API with the `github-token` input (the job's `github.token` by default) and hands upterm the keys, so the token never reaches the session's environment. If any user's keys cannot be fetched, or a user has none, the step fails rather than start a session the others could not join, or one that was open to anyone.
+
 ## Use Custom Upterm Server
 
 To host your own Upterm server, follow the instructions for [deployment across various cloud providers](https://github.com/owenthereal/upterm?tab=readme-ov-file#hammer_and_wrench-deployment).
@@ -162,6 +164,27 @@ By default, detached mode's timeout starts after all regular steps finish: that 
 
 As this mode has turned out to be so useful as to having the potential for being the default mode once time travel becomes available, it is also available as `owenthereal/action-upterm/detached` for convenience.
 
+### Wait for a Detached Session Mid-Job
+
+The post step waits for the session only after every regular step, cleanup steps included. To debug before cleanup runs, hold the job with the wait step:
+
+```yaml
+    steps:
+    - uses: owenthereal/action-upterm/detached@v2
+    - name: Run tests with debug session available
+      run: npm test
+    - name: Hold here while someone debugs
+      if: ${{ failure() }}
+      uses: owenthereal/action-upterm/wait@v2
+      with:
+        timeout-minutes: 30 # default 120
+    - name: Tear down test environment
+      if: ${{ always() }}
+      run: make teardown
+```
+
+The wait step returns when the session ends, when a `continue` file is touched (see [Continue a Workflow](#continue-a-workflow)), or after `timeout-minutes`. It only watches: on a `continue` file or a timeout the session keeps running, and the post step still waits for it at the end of the job as usual.
+
 ## Continue a Workflow
 
 To resume your workflow within an `upterm` session, create a file named `continue` in one of these locations:
@@ -181,6 +204,20 @@ How you leave the SSH connection matters:
 - ssh's own `~.` escape sequence (or just closing your terminal window) only disconnects your terminal — the session itself keeps running and waiting for a client, and the workflow does not resume. Reconnect with the same SSH command to pick up where you left off.
 - Typing `exit` or pressing `Ctrl-D` sends EOF to the session's shell, which quits. That ends the session, and the workflow resumes immediately as a result.
 - Touching the continue file resumes the workflow the same way `exit`/`Ctrl-D` does, but without ending the session: it keeps running, reachable over SSH, until the job's post step stops it at the end of the job — the same cleanup that stops any session still up when the job finishes.
+
+## Choose the Session's Shell
+
+upterm gives the shell this step's environment, PATH included. With `inherit-path: true` (the default), the shell is `/bin/bash --noprofile --norc -i`. It reads no startup files, so PATH can't be reset before your first prompt by `/etc/profile`, `~/.bashrc` or a container's init. That reset is a common problem with Nix devshells and other container images. Set `inherit-path: false` to have upterm host `$SHELL` with its usual startup files.
+
+If your container's environment comes from a wrapper shell, name it in `default-shell`, which takes precedence:
+
+```yaml
+    - uses: owenthereal/action-upterm@v2
+      with:
+        default-shell: /opt/env/bin/bash
+```
+
+On Windows the session hosts MSYS2's login bash, unless `default-shell` is set.
 
 ## Usage Tips
 

@@ -345,6 +345,12 @@ function validateInputs(): void {
 
 export async function run() {
   try {
+    // wait/action.yml runs this same bundle, as a separate action with no post.
+    if (core.getInput('wait-for-session') === 'true') {
+      await runWaitStep();
+      return;
+    }
+
     // Check if this is the POST action
     if (core.getState('isPost') === 'true') {
       await runPost();
@@ -374,7 +380,7 @@ export async function run() {
     const session = await startUptermSession(allowedUsers);
 
     if (core.getInput('detached') === 'true') {
-      await runDetachedMode(session);
+      await runDetachedMode(session, continueFilesAtLaunch);
       return;
     }
 
@@ -531,12 +537,93 @@ function getAllowedUsers(): string[] {
 }
 
 /**
- * The command the session hosts, as a CLI suffix. Unix: none, so upterm runs
- * $SHELL. Windows: MSYS2's login bash - what v1's tmux ran - found as
+ * The command the session hosts, as a CLI suffix.
+ *
+ * default-shell, when given, on every platform: a container's wrapper shell
+ * (/opt/env/bin/bash, say) that sets up the environment itself.
+ *
+ * Otherwise Windows hosts MSYS2's login bash - what v1's tmux ran - found as
  * /usr/bin/bash because this command line is run by MSYS2 bash.
+ *
+ * Otherwise, with inherit-path, a bash that reads no startup files. The daemon
+ * hands the hosted command this step's environment, PATH included, but $SHELL
+ * would source /etc/profile, ~/.bashrc and the like - and in Nix devshells and
+ * container images those reset PATH to the system default before the guest's
+ * first prompt. Without inherit-path: none, so upterm runs $SHELL.
  */
 function hostedCommand(): string {
-  return process.platform === 'win32' ? ' -- bash -l' : '';
+  const defaultShell = core.getInput('default-shell').trim();
+  if (defaultShell) return ` -- ${shellEscape(defaultShell)}`;
+  if (process.platform === 'win32') return ' -- bash -l';
+  if (core.getInput('inherit-path') === 'true') return ' -- /bin/bash --noprofile --norc -i';
+  return '';
+}
+
+/**
+ * The GitHub Enterprise Server this run is on, as host[:port], or null on
+ * github.com. GITHUB_SERVER_URL is set on every runner.
+ */
+function enterpriseHost(): string | null {
+  const serverUrl = process.env.GITHUB_SERVER_URL || '';
+  if (!serverUrl || /^https?:\/\/github\.com\/?$/i.test(serverUrl)) return null;
+  try {
+    return new URL(serverUrl).host;
+  } catch {
+    core.warning(`Could not parse GITHUB_SERVER_URL=${serverUrl}; authorizing users on github.com.`);
+    return null;
+  }
+}
+
+/**
+ * The flags that limit who can join, as a CLI suffix; none for no users.
+ *
+ * github.com: --authorized-user github:NAME, and upterm fetches the keys.
+ *
+ * GitHub Enterprise Server: this step fetches the keys with github-token,
+ * through the instance's API (GITHUB_API_URL, which Octokit targets), and hands
+ * upterm an authorized_keys file. Not --authorized-user github:NAME@HOST with
+ * the token in GH_ENTERPRISE_TOKEN: the daemon passes its environment to the
+ * hosted shell, so every guest could read the token. Without a token, upterm
+ * fetches anonymously, which an instance in private mode refuses.
+ *
+ * Any user whose keys cannot be fetched, or who has none, fails the launch, as
+ * upterm does for --authorized-user: a partial set could narrow "only alice
+ * and bob" to "only alice" without anyone noticing.
+ */
+async function authorizationFlags(allowedUsers: string[], configDir: string, configDirArg: string): Promise<string> {
+  if (allowedUsers.length === 0) return '';
+
+  const host = enterpriseHost();
+  if (!host) return allowedUsers.map(user => ` --authorized-user ${shellEscape(`github:${user}`)}`).join('');
+
+  const token = core.getInput('github-token') || process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
+  if (!token) {
+    core.warning(`No github-token for ${host}: upterm will fetch SSH keys anonymously, which fails on an instance in private mode.`);
+    return allowedUsers.map(user => ` --authorized-user ${shellEscape(`github:${user}@${host}`)}`).join('');
+  }
+
+  const octokit = github.getOctokit(token);
+  const lines: string[] = [];
+  const failures: string[] = [];
+  for (const username of allowedUsers) {
+    try {
+      const keys = await octokit.paginate(octokit.rest.users.listPublicKeysForUser, {username, per_page: 100});
+      if (keys.length === 0) {
+        failures.push(`${username}: no public SSH keys on ${host}`);
+        continue;
+      }
+      core.info(`Fetched ${keys.length} SSH key(s) for ${username} from ${host}`);
+      for (const k of keys) lines.push(`${k.key} ${username}@${host}`);
+    } catch (error) {
+      failures.push(`${username}: ${error}`);
+    }
+  }
+  if (failures.length) {
+    throw new Error(`Could not authorize every user in limit-access-to-users / limit-access-to-actor:\n  ${failures.join('\n  ')}`);
+  }
+
+  fs.writeFileSync(path.join(configDir, 'authorized_keys'), lines.join('\n') + '\n', {mode: 0o600});
+  return ` --authorized-keys ${shellEscape(`${configDirArg}/authorized_keys`)}`;
 }
 
 /**
@@ -588,7 +675,7 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   fs.writeFileSync(path.join(dirs.config, 'known_hosts'), knownHosts + '\n', {mode: 0o600});
   const knownHostsArg = `${xdg.config}/known_hosts`;
 
-  const auth = allowedUsers.map(user => ` --authorized-user ${shellEscape(`github:${user}`)}`).join('');
+  const auth = await authorizationFlags(allowedUsers, dirs.config, xdg.config);
   // getSessionName() is gha- + 8 hex characters: shell-safe by construction.
   const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${launchJoinTimeoutFlag()}${hostedCommand()}`;
 
@@ -934,7 +1021,7 @@ async function armJoinTimeout(): Promise<boolean> {
   }
 }
 
-type WaitEnd = 'continue' | 'ended';
+type WaitEnd = 'continue' | 'ended' | 'timeout';
 
 /**
  * Wait for this run's session to end, or for the continue file. Observes only:
@@ -954,8 +1041,11 @@ type WaitEnd = 'continue' | 'ended';
  *
  * Only a continue file created or touched since the launch (`atLaunch`) ends
  * the wait; one left from before is warned about, once.
+ *
+ * A `deadline` (epoch ms) ends the wait too, leaving the session running: the
+ * wait step's timeout-minutes.
  */
-async function waitForSession(message: string, atLaunch: ContinueFilesSnapshot): Promise<WaitEnd> {
+async function waitForSession(message: string, atLaunch: ContinueFilesSnapshot, deadline?: number): Promise<WaitEnd> {
   let joined = false;
   let staleReported = false;
   let lastOutage: string | null = null;
@@ -963,6 +1053,8 @@ async function waitForSession(message: string, atLaunch: ContinueFilesSnapshot):
 
   /*eslint no-constant-condition: ["error", { "checkLoops": false }]*/
   while (true) {
+    if (deadline !== undefined && Date.now() >= deadline) return 'timeout';
+
     const continueFiles = checkContinueFiles(atLaunch);
     if (continueFiles.touched) {
       core.info("Exiting debugging session because '/continue' file was created");
@@ -1015,7 +1107,7 @@ async function waitForSession(message: string, atLaunch: ContinueFilesSnapshot):
   }
 }
 
-async function runDetachedMode(session: SessionInfo): Promise<void> {
+async function runDetachedMode(session: SessionInfo, continueFilesAtLaunch: ContinueFilesSnapshot): Promise<void> {
   core.debug('Entering detached mode');
 
   // launchSession() already proved this session has a usable connect string.
@@ -1030,8 +1122,68 @@ async function runDetachedMode(session: SessionInfo): Promise<void> {
   // Save state for the POST action
   core.saveState('message', message);
 
+  // And for the wait step, which is another action and cannot read this one's
+  // state. exportXdgEnvironment() already ran in launchSession().
+  const handoff: DetachedSessionHandoff = {
+    name: getSessionName(),
+    xdg: {runtime: process.env.XDG_RUNTIME_DIR || '', state: process.env.XDG_STATE_HOME || '', config: process.env.XDG_CONFIG_HOME || ''},
+    continueFilesAtLaunch,
+    message
+  };
+  core.exportVariable(DETACHED_SESSION_ENV, JSON.stringify(handoff));
+
   console.log(message);
   core.info('Detached mode: workflow will continue while upterm session is active');
+}
+
+/** What detached mode leaves in DETACHED_SESSION_ENV for the wait step. */
+interface DetachedSessionHandoff {
+  name: string;
+  xdg: XdgPaths;
+  continueFilesAtLaunch: ContinueFilesSnapshot;
+  message: string;
+}
+
+const DETACHED_SESSION_ENV = 'UPTERM_ACTION_DETACHED_SESSION';
+
+/**
+ * The wait step (wait/action.yml): hold the job at this step until the
+ * detached session started earlier in the job ends, a continue file is
+ * touched, or timeout-minutes pass - so that inline cleanup steps can run
+ * after a debugging session rather than before it.
+ *
+ * Only observes, like the post step's wait: the session is left running on a
+ * timeout or a continue file, and detached mode's post step still owns its end.
+ */
+async function runWaitStep(): Promise<void> {
+  const raw = process.env[DETACHED_SESSION_ENV];
+  if (!raw) {
+    core.info('No detached upterm session was started earlier in this job; nothing to wait for.');
+    return;
+  }
+
+  let handoff: DetachedSessionHandoff;
+  try {
+    handoff = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Could not read ${DETACHED_SESSION_ENV}: ${error}`);
+  }
+
+  sessionNameCache = handoff.name;
+  process.env.XDG_RUNTIME_DIR = handoff.xdg.runtime;
+  process.env.XDG_STATE_HOME = handoff.xdg.state;
+  process.env.XDG_CONFIG_HOME = handoff.xdg.config;
+
+  const minutes = parseInt(core.getInput('timeout-minutes') || '120', 10);
+  if (isNaN(minutes) || minutes <= 0) {
+    throw new Error('timeout-minutes must be a positive integer');
+  }
+
+  core.info(`Holding the workflow here until upterm session ${handoff.name} ends, a continue file is touched, or ${minutes} minute(s) pass.`);
+  const end = await waitForSession(handoff.message, handoff.continueFilesAtLaunch ?? {}, Date.now() + minutes * 60_000);
+  if (end === 'timeout') {
+    core.warning(`Stopped waiting for upterm session ${handoff.name} after ${minutes} minute(s); it is still running, and the post step will wait for it.`);
+  }
 }
 
 /**
