@@ -204,7 +204,7 @@ How you leave the SSH connection matters:
 - ssh's own `~.` escape sequence (or just closing your terminal window) only disconnects your terminal — the session itself keeps running and waiting for a client, and the workflow does not resume. Reconnect with the same SSH command to pick up where you left off.
 - Typing `exit` or pressing `Ctrl-D` sends EOF to the session's shell, which quits. That ends the session, and the workflow resumes immediately as a result. Because that ends the session for everyone, the default shell (see [Choose the Session's Shell](#choose-the-sessions-shell)) asks `Exit? [y/N]` first, and a single `Ctrl-D` only prints a hint: press it twice, or answer `y`.
 - Touching the continue file resumes the workflow the same way `exit`/`Ctrl-D` does, but without ending the session: it keeps running, reachable over SSH, until the job's post step stops it at the end of the job — the same cleanup that stops any session still up when the job finishes.
-- A guest running commands without a terminal ([`allow-exec`](#let-scripts-and-ai-agents-run-commands)) never touches the session's shell, so `ssh <target> exit` ends only that one command. It resumes the workflow the same way, with `ssh <target> 'touch "$GITHUB_WORKSPACE/continue"'`.
+- A guest running commands without a terminal ([`allow-exec`](#let-scripts-and-ai-agents-run-commands)) never touches the session's shell, so `ssh <target> exit` ends only that one command. It resumes the workflow the same way, with `ssh <target> 'touch "$GITHUB_WORKSPACE/continue"'`, or ends the session as `exit` would, with `ssh <target> 'upterm session stop "$UPTERM_SESSION_NAME"'`. That command itself reports status 1, because stopping the session hangs it up too.
 
 ## Choose the Session's Shell
 
