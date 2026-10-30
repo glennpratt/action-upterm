@@ -1484,6 +1484,29 @@ describe('upterm GitHub integration', () => {
       expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('No github-token for ghe.example.com'));
     });
 
+    it.each([
+      ['GHES', 'https://ghe.example.com'],
+      ['github.com', 'https://github.com']
+    ])('on %s, launches upterm without INPUT_GITHUB-TOKEN in its environment, which the daemon hands to guests', async (_label, serverUrl) => {
+      process.env.GITHUB_SERVER_URL = serverUrl;
+      process.env['INPUT_GITHUB-TOKEN'] = 'ghs_token';
+      keysFor({alice: ['ssh-ed25519 AAAAalice'], bob: ['ssh-rsa AAAAbob']});
+      let tokenAtLaunch: string | undefined = 'not launched';
+      const shell = mockedExecShellCommand.getMockImplementation() as typeof mockedExecShellCommand;
+      mockedExecShellCommand.mockImplementation(async (cmd: string, ...rest) => {
+        if (cmd.includes('upterm host')) tokenAtLaunch = process.env['INPUT_GITHUB-TOKEN'];
+        return shell(cmd, ...rest);
+      });
+      try {
+        await run();
+      } finally {
+        delete process.env['INPUT_GITHUB-TOKEN'];
+      }
+
+      expect(launchCall()).toBeDefined();
+      expect(tokenAtLaunch).toBeUndefined();
+    });
+
     it('leaves github.com to upterm', async () => {
       process.env.GITHUB_SERVER_URL = 'https://github.com';
       await run();

@@ -676,6 +676,12 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   const knownHostsArg = `${xdg.config}/known_hosts`;
 
   const auth = await authorizationFlags(allowedUsers, dirs.config, xdg.config);
+  // The runner hands this process its inputs as INPUT_* variables, and the
+  // daemon passes its environment on to the hosted shell: left in place,
+  // github-token (the job's token by default) would be readable by every
+  // guest, on github.com as much as on GHES. authorizationFlags() has already
+  // read it, and nothing after the launch does.
+  delete process.env['INPUT_GITHUB-TOKEN'];
   // getSessionName() is gha- + 8 hex characters: shell-safe by construction.
   const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${launchJoinTimeoutFlag()}${hostedCommand()}`;
 
