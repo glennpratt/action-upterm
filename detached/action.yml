@@ -33,6 +33,14 @@ inputs:
   upterm-version:
     description: "Upterm version/tag to install (e.g., v0.32.0). Requires v0.32.0 or newer. Defaults to latest when unset."
     required: false
+  upterm-repository:
+    description: "GitHub repository (OWNER/NAME) to download upterm's release from, for a fork's build. Defaults to owenthereal/upterm. upterm-version names the release in it."
+    required: false
+    default: ""
+  allow-exec:
+    description: "If true, guests may run commands without a terminal (ssh <ssh-command target> 'cmd'), each through $SHELL -c in a process of its own with the runner's access, getting its output and exit status back: what scripts and AI agents need, since they can't drive a shared terminal. Needs an upterm with --allow-exec (see upterm-repository). Not on Windows runners."
+    required: false
+    default: "false"
   detached:
     description: "In detached mode, the workflow job will continue while the upterm session is active"
     required: false

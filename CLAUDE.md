@@ -73,6 +73,8 @@ See ARCHITECTURE.md for the full picture (the four `upterm` calls, the wait loop
 - `inherit-path`: Default `true`: host `/bin/bash --noprofile --norc -i` so startup files cannot reset the PATH the daemon passes on (Unix only)
 - `default-shell`: Shell to host instead, on any platform; takes precedence over `inherit-path`
 - `github-token`: Default `${{ github.token }}`; used only on GitHub Enterprise Server to fetch authorized users' keys
+- `upterm-repository`: OWNER/NAME to download upterm's release from (default `owenthereal/upterm`), validated in `validateInputs()`
+- `allow-exec`: Pass `--allow-exec`, letting guests run commands without a pty. `assertAllowExecSupported()` checks `upterm host --help` for the flag (no upstream release has it), and Windows is refused in `validateInputs()`
 
 ## Critical Implementation Details
 

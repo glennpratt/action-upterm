@@ -219,6 +219,30 @@ If your container's environment comes from a wrapper shell, name it in `default-
 
 On Windows the session hosts MSYS2's login bash, unless `default-shell` is set.
 
+## Let Scripts and AI Agents Run Commands
+
+A person can drive the shared terminal; a script or an AI agent can't. With `allow-exec`, a guest can instead run one command at a time over SSH, with no terminal, and get back its output and exit status, as from any SSH server:
+
+```yaml
+    - uses: owenthereal/action-upterm/detached@v2
+      with:
+        limit-access-to-actor: true
+        allow-exec: true
+        # --allow-exec isn't in an owenthereal/upterm release yet:
+        upterm-repository: glennpratt/upterm
+        upterm-version: v0.40.1-exec.1
+```
+
+```bash
+ssh -o BatchMode=yes <ssh-command target> 'cd "$GITHUB_WORKSPACE" && make test 2>&1 | tail -20'
+echo $?                          # the command's own status
+ssh <ssh-command target> 'touch "$GITHUB_WORKSPACE/continue"'   # let the job carry on
+```
+
+Each command runs through `$SHELL -c` on the runner, with the runner's access and the step's environment, PATH included, and never touches the shared terminal. Commands don't go through `default-shell`. For many commands in a row, reuse one connection (`-o ControlMaster=auto -o ControlPath=~/.ssh/upterm-%C -o ControlPersist=10m`). Files go over `scp`/`sftp` as usual. A guest that runs a command counts as having joined, so it stops `wait-timeout-minutes` from ending the session. Not supported on Windows runners.
+
+`upterm-repository` (OWNER/NAME, default `owenthereal/upterm`) is where upterm's release is downloaded from, with `upterm-version` naming the release there. The step checks that the installed upterm has `--allow-exec` and fails with a clear message if it doesn't.
+
 ## Usage Tips
 
 ### Inside the Session

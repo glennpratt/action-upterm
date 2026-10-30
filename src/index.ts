@@ -26,7 +26,10 @@ import {
 import {knownHostsFor} from './knownHosts';
 
 // Constants
-const UPTERM_RELEASE_BASE_URL = 'https://github.com/owenthereal/upterm/releases';
+const UPTERM_DEFAULT_REPOSITORY = 'owenthereal/upterm';
+// OWNER/NAME as GitHub spells them: what upterm-repository must look like
+// before it goes into a download URL.
+const GITHUB_REPOSITORY_PATTERN = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
 const SESSION_STATUS_POLL_INTERVAL = 5000;
 // Consecutive failed lookups between warnings, ~1 minute at the 5s poll
 // interval. The first failure always warns.
@@ -317,13 +320,32 @@ export function getUptermDownloadUrl(platform: 'linux' | 'darwin' | 'win32', nod
   const versionInput = core.getInput('upterm-version');
   const version = versionInput?.trim();
   const versionSegment = version ? `download/${version}` : 'latest/download';
-  const url = `${UPTERM_RELEASE_BASE_URL}/${versionSegment}/${filename}`;
+  const url = `https://github.com/${uptermRepository()}/releases/${versionSegment}/${filename}`;
 
   core.debug(`Upterm download URL resolved to ${url}`);
   return url;
 }
 
+/**
+ * The GitHub repository upterm's release is downloaded from: upterm-repository,
+ * for a fork's build, or owenthereal/upterm. validateInputs() has already
+ * refused one that isn't OWNER/NAME.
+ */
+function uptermRepository(): string {
+  return core.getInput('upterm-repository').trim() || UPTERM_DEFAULT_REPOSITORY;
+}
+
 function validateInputs(): void {
+  if (!GITHUB_REPOSITORY_PATTERN.test(uptermRepository())) {
+    throw new Error(`upterm-repository must be a GitHub repository as OWNER/NAME, e.g. ${UPTERM_DEFAULT_REPOSITORY}`);
+  }
+
+  // upterm refuses --allow-exec on Windows; said here, before anything is
+  // downloaded, rather than by a launch that fails.
+  if (core.getInput('allow-exec') === 'true' && process.platform === 'win32') {
+    throw new Error('allow-exec is not supported on Windows runners');
+  }
+
   const waitTimeout = core.getInput('wait-timeout-minutes');
   if (waitTimeout) {
     const parsedTimeout = parseInt(waitTimeout, 10);
@@ -376,6 +398,7 @@ export async function run() {
 
     await installDependencies();
     await assertSupportedUptermVersion();
+    await assertAllowExecSupported();
     const continueFilesAtLaunch = snapshotContinueFiles();
     const session = await startUptermSession(allowedUsers);
 
@@ -626,6 +649,33 @@ async function authorizationFlags(allowedUsers: string[], configDir: string, con
   return ` --authorized-keys ${shellEscape(`${configDirArg}/authorized_keys`)}`;
 }
 
+/** ` --allow-exec` with allow-exec, nothing otherwise. */
+function allowExecFlag(): string {
+  return core.getInput('allow-exec') === 'true' ? ' --allow-exec' : '';
+}
+
+/**
+ * Refuse allow-exec against an upterm that has no --allow-exec, before the
+ * launch: upterm would reject the unknown flag there, with a message about the
+ * flag rather than about which upterm to use. No upterm release from
+ * owenthereal/upterm has it yet, so this asks the binary, not the version.
+ */
+async function assertAllowExecSupported(): Promise<void> {
+  if (core.getInput('allow-exec') !== 'true') return;
+  let help = '';
+  try {
+    help = await execShellCommand('upterm host --help', {quiet: true});
+  } catch (error) {
+    core.debug(`upterm host --help failed: ${error}`);
+  }
+  if (!help.includes('--allow-exec')) {
+    throw new Error(
+      `allow-exec needs an upterm with --allow-exec, and the one installed from ${uptermRepository()} (upterm-version: ${core.getInput('upterm-version') || 'latest'}) has none. ` +
+        'Set upterm-repository and upterm-version to a release that has it.'
+    );
+  }
+}
+
 /**
  * `--join-timeout Nm` for an attached launch with wait-timeout-minutes above
  * 0; nothing otherwise. upterm counts it from readiness and ends the session
@@ -683,7 +733,7 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   // read it, and nothing after the launch does.
   delete process.env['INPUT_GITHUB-TOKEN'];
   // getSessionName() is gha- + 8 hex characters: shell-safe by construction.
-  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${launchJoinTimeoutFlag()}${hostedCommand()}`;
+  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${allowExecFlag()}${launchJoinTimeoutFlag()}${hostedCommand()}`;
 
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
   // Evidence for the post step that there may be a session to stop. Saved

@@ -127,6 +127,8 @@ function baselineInputs(): void {
   when(core.getInput).calledWith('default-shell').mockReturnValue('');
   when(core.getInput).calledWith('github-token').mockReturnValue('');
   when(core.getInput).calledWith('wait-for-session').mockReturnValue('');
+  when(core.getInput).calledWith('upterm-repository').mockReturnValue('');
+  when(core.getInput).calledWith('allow-exec').mockReturnValue('');
 }
 
 /**
@@ -273,6 +275,79 @@ describe('upterm GitHub integration', () => {
       when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.30.0');
       expect(getUptermDownloadUrl('linux', 'x64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.30.0/upterm_linux_amd64.tar.gz');
       expect(getUptermDownloadUrl('win32', 'arm64')).toBe('https://github.com/owenthereal/upterm/releases/download/v0.30.0/upterm_windows_arm64.tar.gz');
+    });
+
+    it("builds download url from upterm-repository's releases, for a fork's build", () => {
+      when(core.getInput).calledWith('upterm-repository').mockReturnValue(' glennpratt/upterm ');
+      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.40.1-exec.1');
+      expect(getUptermDownloadUrl('linux', 'x64')).toBe('https://github.com/glennpratt/upterm/releases/download/v0.40.1-exec.1/upterm_linux_amd64.tar.gz');
+    });
+  });
+
+  describe('upterm-repository and allow-exec', () => {
+    const launchCall = () => mockedExecShellCommand.mock.calls.map(c => c[0]).find(c => c.includes('upterm host --detach'));
+
+    /** A shell whose upterm answers `host --help` with helpText, and launches. */
+    function uptermWithHelp(helpText: string): void {
+      mockedExecShellCommand.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('upterm version')) return 'Upterm version 0.40.1-exec.1\n';
+        if (cmd.includes('upterm host --help')) return helpText;
+        if (cmd.includes('upterm host')) return readySession();
+        if (cmd.includes('session info')) return endedResponse;
+        return '';
+      });
+    }
+
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+      fsWithoutExitFiles();
+    });
+
+    it('refuses an upterm-repository that is not OWNER/NAME, before downloading anything', async () => {
+      when(core.getInput).calledWith('upterm-repository').mockReturnValue('https://evil.example/x');
+      await run();
+      expect(core.setFailed).toHaveBeenCalledWith('upterm-repository must be a GitHub repository as OWNER/NAME, e.g. owenthereal/upterm');
+      expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+    });
+
+    it('launches with --allow-exec when the installed upterm has it', async () => {
+      when(core.getInput).calledWith('allow-exec').mockReturnValue('true');
+      uptermWithHelp('      --allow-exec   Let guests run commands without a terminal\n');
+      await run();
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(launchCall()).toMatch(/ --allow-exec( |$)/);
+    });
+
+    it('does not pass --allow-exec, or ask upterm about it, without allow-exec', async () => {
+      uptermWithHelp('');
+      await run();
+      expect(launchCall()).not.toContain('--allow-exec');
+      expect(mockedExecShellCommand.mock.calls.map(c => c[0])).not.toContainEqual(expect.stringContaining('--help'));
+    });
+
+    it('fails before the launch, naming where upterm came from, when the installed upterm has no --allow-exec', async () => {
+      when(core.getInput).calledWith('allow-exec').mockReturnValue('true');
+      uptermWithHelp('      --read-only   Let guests only watch\n');
+      await run();
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('allow-exec needs an upterm with --allow-exec, and the one installed from owenthereal/upterm (upterm-version: latest) has none'));
+      expect(launchCall()).toBeUndefined();
+    });
+
+    it('refuses allow-exec on Windows before downloading anything', async () => {
+      Object.defineProperty(process, 'platform', {value: 'win32'});
+      when(core.getInput).calledWith('allow-exec').mockReturnValue('true');
+      await run();
+      expect(core.setFailed).toHaveBeenCalledWith('allow-exec is not supported on Windows runners');
+      expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+    });
+
+    it('downloads from upterm-repository', async () => {
+      when(core.getInput).calledWith('upterm-repository').mockReturnValue('glennpratt/upterm');
+      when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.40.1-exec.1');
+      uptermWithHelp('');
+      await run();
+      expect(mockedToolCache.downloadTool).toHaveBeenCalledWith('https://github.com/glennpratt/upterm/releases/download/v0.40.1-exec.1/upterm_linux_amd64.tar.gz');
     });
   });
 
