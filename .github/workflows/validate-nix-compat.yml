@@ -1,0 +1,80 @@
+name: Validate nix-compat-v2
+
+# Real-runner checks for inherit-path, default-shell and the wait step. Push a
+# validate/** branch to run it. A driver joins each job's session as the user
+# who pushed (limit-access-to-actor) and plays the guest side of its scenario;
+# linux-wait-timeout has no guest.
+on:
+  push:
+    branches: ['validate/**']
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Guest checks PATH, then exits: the session ends, the wait step returns.
+          - {name: linux-inherit-path, os: ubuntu-latest, inherit-path: 'true', default-shell: '', wait-minutes: '10'}
+          # Guest checks PATH (expected reset), then touches continue and drops.
+          - {name: linux-no-inherit-path, os: ubuntu-latest, inherit-path: 'false', default-shell: '', wait-minutes: '10'}
+          # Guest checks it is in the wrapper shell, then exits.
+          - {name: linux-default-shell, os: ubuntu-latest, inherit-path: 'true', default-shell: '/tmp/validate-env/bin/bash', wait-minutes: '10'}
+          # No guest: the wait step times out, then upterm's join timeout ends it in post.
+          - {name: linux-wait-timeout, os: ubuntu-latest, inherit-path: 'true', default-shell: '', wait-minutes: '1'}
+          - {name: macos-inherit-path, os: macos-latest, inherit-path: 'true', default-shell: '', wait-minutes: '10'}
+          - {name: windows, os: windows-latest, inherit-path: 'true', default-shell: '', wait-minutes: '10'}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Arrange a PATH entry, startup files that reset PATH, and a wrapper shell
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/marker/bin"
+          printf '#!/bin/sh\necho MARKER_OK\n' > "$RUNNER_TEMP/marker/bin/validate-marker"
+          chmod +x "$RUNNER_TEMP/marker/bin/validate-marker"
+          echo "$RUNNER_TEMP/marker/bin" >> "$GITHUB_PATH"
+          if [ "$RUNNER_OS" != Windows ]; then
+            # What Nix devshells and container images do to an interactive shell.
+            for rc in ~/.bashrc ~/.zshrc; do echo 'export PATH=/usr/bin:/bin' >> "$rc"; done
+            mkdir -p /tmp/validate-env/bin
+            printf '#!/bin/bash\nexport VALIDATE_WRAPPED=1\nexec /bin/bash --noprofile --norc -i\n' > /tmp/validate-env/bin/bash
+            chmod +x /tmp/validate-env/bin/bash
+          fi
+
+      - name: Start upterm session
+        id: upterm
+        uses: ./detached
+        with:
+          limit-access-to-actor: true
+          wait-timeout-minutes: 2
+          inherit-path: ${{ matrix.inherit-path }}
+          default-shell: ${{ matrix.default-shell }}
+
+      - name: Publish the ssh command for the driver
+        shell: bash
+        env:
+          SSH_COMMAND: ${{ steps.upterm.outputs.ssh-command }}
+        run: echo "$SSH_COMMAND" > ssh-command.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-command-${{ matrix.name }}
+          path: ssh-command.txt
+
+      - name: Wait for the session
+        uses: ./wait
+        with:
+          timeout-minutes: ${{ matrix.wait-minutes }}
+
+      - name: After the wait
+        shell: bash
+        run: echo "AFTER_WAIT continue=$([ -e "$GITHUB_WORKSPACE/continue" ] && echo yes || echo no)"
