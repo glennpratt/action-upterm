@@ -574,13 +574,44 @@ function getAllowedUsers(): string[] {
  * container images those reset PATH to the system default before the guest's
  * first prompt. Without inherit-path: none, so upterm runs $SHELL.
  */
-function hostedCommand(): string {
+function hostedCommand(sessionRcArg: string): string {
   const defaultShell = core.getInput('default-shell').trim();
   if (defaultShell) return ` -- ${shellEscape(defaultShell)}`;
   if (process.platform === 'win32') return ' -- bash -l';
-  if (core.getInput('inherit-path') === 'true') return ' -- /bin/bash --noprofile --norc -i';
+  if (core.getInput('inherit-path') === 'true') return ` -- /bin/bash --noprofile --rcfile ${shellEscape(sessionRcArg)} -i`;
   return '';
 }
+
+/**
+ * What the bash inherit-path hosts reads in place of ~/.bashrc. It sets
+ * nothing about PATH, which is the point of not reading the user's.
+ *
+ * With no tmux, the session's shell is the session: `exit` in it ends the
+ * session for everyone, which a guest who only meant to leave would not
+ * expect. So whoever is on the screen when the shell starts is told how to end
+ * it and how to let the workflow go on without ending it, `exit` asks first,
+ * and one stray Ctrl-D only prints bash's own hint. An EOF at the question
+ * exits: the terminal has gone.
+ */
+export const SESSION_RC = `# Written by action-upterm for this session's shell, in place of ~/.bashrc.
+# It leaves PATH as the workflow step had it.
+printf '%s\\n' \\
+  '' \\
+  'This is an upterm session on a GitHub Actions runner.' \\
+  '  exit                                  ends the session for everyone' \\
+  '  touch "$GITHUB_WORKSPACE/continue"    lets the workflow continue; the session stays up' \\
+  ''
+IGNOREEOF=1
+exit() {
+  local reply
+  printf 'exit ends this upterm session for everyone.\\n'
+  read -r -p 'Exit? [y/N] ' reply || reply=y
+  case $reply in
+    [yY]*) builtin exit "$@" ;;
+  esac
+  printf '%s\\n' 'Not exiting. To let the workflow continue and keep the session: touch "$GITHUB_WORKSPACE/continue"'
+}
+`;
 
 /**
  * The GitHub Enterprise Server this run is on, as host[:port], or null on
@@ -724,6 +755,8 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   // `win32 ? toMsys2Path : toShellPath` here.
   fs.writeFileSync(path.join(dirs.config, 'known_hosts'), knownHosts + '\n', {mode: 0o600});
   const knownHostsArg = `${xdg.config}/known_hosts`;
+  fs.writeFileSync(path.join(dirs.config, 'session.bashrc'), SESSION_RC, {mode: 0o600});
+  const sessionRcArg = `${xdg.config}/session.bashrc`;
 
   const auth = await authorizationFlags(allowedUsers, dirs.config, xdg.config);
   // The runner hands this process its inputs as INPUT_* variables, and the
@@ -733,7 +766,7 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   // read it, and nothing after the launch does.
   delete process.env['INPUT_GITHUB-TOKEN'];
   // getSessionName() is gha- + 8 hex characters: shell-safe by construction.
-  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${allowExecFlag()}${launchJoinTimeoutFlag()}${hostedCommand()}`;
+  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${allowExecFlag()}${launchJoinTimeoutFlag()}${hostedCommand(sessionRcArg)}`;
 
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
   // Evidence for the post step that there may be a session to stop. Saved

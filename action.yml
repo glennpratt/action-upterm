@@ -46,7 +46,7 @@ inputs:
     required: false
     default: "false"
   inherit-path:
-    description: "If true, the session hosts a bash that reads no startup files (/bin/bash --noprofile --norc -i), so the guest's shell keeps this step's PATH instead of having /etc/profile, ~/.bashrc or a container's init reset it. If false, upterm hosts $SHELL. Ignored on Windows, and when default-shell is set."
+    description: "If true, the session hosts a bash that reads none of the system's or user's startup files (/bin/bash --noprofile --rcfile <the action's> -i), so the guest's shell keeps this step's PATH instead of having /etc/profile, ~/.bashrc or a container's init reset it. The action's rc file only prints how to end or continue, and asks before exit ends the session for everyone. If false, upterm hosts $SHELL. Ignored on Windows, and when default-shell is set."
     required: false
     default: "true"
   default-shell:
