@@ -41,6 +41,14 @@ inputs:
     description: "If true, guests may run commands without a terminal (ssh <ssh-command target> 'cmd'), each through $SHELL -c in a process of its own with the runner's access, getting its output and exit status back: what scripts and AI agents need, since they can't drive a shared terminal. Needs an upterm with --allow-exec (see upterm-repository). Not on Windows runners."
     required: false
     default: "false"
+  ssh-command-status:
+    description: "If true, publish the session's ssh command as a commit status (on the pull request's head commit, for a pull_request event), so that a program -- an AI agent, a script -- can read it while the job runs: GitHub serves the job's log only once the job has finished. Needs `permissions: statuses: write`; without it the step fails before starting a session. Marked ended when the post step stops the session."
+    required: false
+    default: "false"
+  ssh-command-status-context:
+    description: "The commit status's context (its name) for ssh-command-status. Defaults to 'upterm / <job id>'; set it per matrix entry, whose jobs share an id."
+    required: false
+    default: ""
   detached:
     description: "In detached mode, the workflow job will continue while the upterm session is active"
     required: false

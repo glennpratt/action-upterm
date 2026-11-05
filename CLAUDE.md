@@ -74,6 +74,7 @@ See ARCHITECTURE.md for the full picture (the four `upterm` calls, the wait loop
 - `default-shell`: Shell to host instead, on any platform; takes precedence over `inherit-path`
 - `github-token`: Default `${{ github.token }}`; used only on GitHub Enterprise Server to fetch authorized users' keys
 - `upterm-repository`: OWNER/NAME to download upterm's release from (default `owenthereal/upterm`), validated in `validateInputs()`
+- `ssh-command-status` / `ssh-command-status-context`: Publish the ssh command as a commit status (`src/commitStatus.ts`), on the PR head for `pull_request`. The first `pending` status is posted before `installDependencies()` and doubles as the permission check: it fails the step (needs `statuses: write`); later updates (`ready`, `error` on a failed launch, `success` from `finalizeSession()`) only warn. The client is built before the launch because `INPUT_GITHUB-TOKEN` is deleted from the environment then. The post step's target is saved only once the session is ready
 - `allow-exec`: Pass `--allow-exec`, letting guests run commands without a pty. `assertAllowExecSupported()` checks `upterm host --help` for the flag (no upstream release has it), and Windows is refused in `validateInputs()`
 
 ## Critical Implementation Details

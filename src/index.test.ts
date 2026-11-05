@@ -129,6 +129,8 @@ function baselineInputs(): void {
   when(core.getInput).calledWith('wait-for-session').mockReturnValue('');
   when(core.getInput).calledWith('upterm-repository').mockReturnValue('');
   when(core.getInput).calledWith('allow-exec').mockReturnValue('');
+  when(core.getInput).calledWith('ssh-command-status').mockReturnValue('');
+  when(core.getInput).calledWith('ssh-command-status-context').mockReturnValue('');
 }
 
 /**
@@ -281,6 +283,132 @@ describe('upterm GitHub integration', () => {
       when(core.getInput).calledWith('upterm-repository').mockReturnValue(' glennpratt/upterm ');
       when(core.getInput).calledWith('upterm-version').mockReturnValue('v0.40.1-exec.1');
       expect(getUptermDownloadUrl('linux', 'x64')).toBe('https://github.com/glennpratt/upterm/releases/download/v0.40.1-exec.1/upterm_linux_amd64.tar.gz');
+    });
+  });
+
+  describe('ssh-command-status', () => {
+    const env = {GITHUB_RUN_ID: '777', GITHUB_RUN_ATTEMPT: '2', GITHUB_JOB: 'build', GITHUB_SERVER_URL: 'https://github.com'};
+    const saved: Record<string, string | undefined> = {};
+    let createCommitStatus: jest.Mock;
+    let gh: {context: Record<string, unknown>; getOctokit: jest.Mock};
+
+    const statuses = () => createCommitStatus.mock.calls.map(c => c[0]);
+
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', {value: 'linux'});
+      Object.defineProperty(process, 'arch', {value: 'x64'});
+      fsWithoutExitFiles();
+      baselineShell(readySession(), endedResponse);
+      for (const [k, v] of Object.entries(env)) {
+        saved[k] = process.env[k];
+        process.env[k] = v;
+      }
+      when(core.getInput).calledWith('github-token').mockReturnValue('ghs_token');
+      gh = require('@actions/github');
+      gh.context.sha = 'mergesha';
+      gh.context.payload = {};
+      createCommitStatus = jest.fn().mockResolvedValue({});
+      gh.getOctokit.mockReturnValue({rest: {repos: {createCommitStatus}}});
+    });
+
+    afterEach(() => {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    });
+
+    it('posts nothing unless opted in', async () => {
+      await run();
+      expect(createCommitStatus).not.toHaveBeenCalled();
+    });
+
+    it('posts pending before the launch, then the ssh command once the session is ready', async () => {
+      when(core.getInput).calledWith('ssh-command-status').mockReturnValue('true');
+      await run();
+
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(gh.getOctokit).toHaveBeenCalledWith('ghs_token');
+      const common = {
+        owner: 'test-owner',
+        repo: 'test-repo',
+        sha: 'mergesha',
+        context: 'upterm / build',
+        target_url: 'https://github.com/test-owner/test-repo/actions/runs/777/attempts/2'
+      };
+      expect(statuses()).toEqual([
+        {...common, state: 'pending', description: 'Starting an upterm session'},
+        {...common, state: 'pending', description: 'ssh user@session123.upterm.dev'}
+      ]);
+      // The first status goes out before upterm is downloaded.
+      expect(createCommitStatus.mock.invocationCallOrder[0]).toBeLessThan(mockedToolCache.downloadTool.mock.invocationCallOrder[0]);
+      expect(core.saveState).toHaveBeenCalledWith('sshCommandStatus', JSON.stringify(common).replace('"target_url"', '"targetUrl"'));
+    });
+
+    it("posts on a pull request's head commit, which is what the pull request shows", async () => {
+      when(core.getInput).calledWith('ssh-command-status').mockReturnValue('true');
+      gh.context.payload = {pull_request: {head: {sha: 'headsha'}}};
+      await run();
+      expect(statuses().map(st => st.sha)).toEqual(['headsha', 'headsha']);
+    });
+
+    it('takes its context from ssh-command-status-context, for matrix jobs that share an id', async () => {
+      when(core.getInput).calledWith('ssh-command-status').mockReturnValue('true');
+      when(core.getInput).calledWith('ssh-command-status-context').mockReturnValue('upterm / linux');
+      await run();
+      expect(statuses().map(st => st.context)).toEqual(['upterm / linux', 'upterm / linux']);
+    });
+
+    it('fails before downloading anything when the token may not post statuses, and says which permission', async () => {
+      when(core.getInput).calledWith('ssh-command-status').mockReturnValue('true');
+      createCommitStatus.mockRejectedValue(Object.assign(new Error('Resource not accessible by integration'), {status: 403}));
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('ssh-command-status could not post a commit status on mergesha'));
+      expect(core.setFailed).toHaveBeenCalledWith(expect.stringContaining('`permissions: statuses: write`'));
+      expect(mockedToolCache.downloadTool).not.toHaveBeenCalled();
+      expect(mockedExecShellCommand.mock.calls.map(c => c[0])).not.toContainEqual(expect.stringContaining('upterm host'));
+    });
+
+    it('only warns when a later update fails: the session carries on', async () => {
+      when(core.getInput).calledWith('ssh-command-status').mockReturnValue('true');
+      createCommitStatus.mockResolvedValueOnce({}).mockRejectedValue(new Error('Bad Gateway'));
+      await run();
+
+      expect(core.setFailed).not.toHaveBeenCalled();
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining('Could not update commit status "upterm / build"'));
+    });
+
+    it('marks the status as an error when the launch fails after the first one', async () => {
+      when(core.getInput).calledWith('ssh-command-status').mockReturnValue('true');
+      baselineShell(noDetail);
+      await run();
+
+      expect(core.setFailed).toHaveBeenCalled();
+      expect(statuses().map(st => [st.state, st.description])).toEqual([
+        ['pending', 'Starting an upterm session'],
+        ['error', 'The upterm session could not start']
+      ]);
+      expect(core.saveState).not.toHaveBeenCalledWith('sshCommandStatus', expect.anything());
+    });
+
+    it('marks it ended in the post step, once the session is stopped', async () => {
+      const target = {owner: 'o', repo: 'r', sha: 's', context: 'upterm / build', targetUrl: 'u'};
+      postState({sshCommandStatus: JSON.stringify(target)});
+      baselineShell(endedResponse);
+      await run();
+
+      expect(statuses()).toEqual([{owner: 'o', repo: 'r', sha: 's', context: 'upterm / build', target_url: 'u', state: 'success', description: 'The upterm session has ended'}]);
+      const stop = mockedExecShellCommand.mock.calls.findIndex(c => c[0].includes('session stop'));
+      expect(stop).toBeGreaterThanOrEqual(0);
+      expect(createCommitStatus.mock.invocationCallOrder[0]).toBeGreaterThan(mockedExecShellCommand.mock.invocationCallOrder[stop]);
+    });
+
+    it('posts nothing in the post step when main published no status', async () => {
+      postState();
+      baselineShell(endedResponse);
+      await run();
+      expect(createCommitStatus).not.toHaveBeenCalled();
     });
   });
 

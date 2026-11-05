@@ -220,6 +220,38 @@ If your container's environment comes from a wrapper shell, name it in `default-
 
 On Windows the session hosts MSYS2's login bash, unless `default-shell` is set.
 
+## Read the SSH Command From a Program
+
+A job's log and step outputs aren't available from GitHub's API until the job has finished, so a program waiting to connect (an AI agent, a script) can't read the ssh command there. With `ssh-command-status`, the action publishes it as a commit status, which is live on github.com and GitHub Enterprise Server alike:
+
+```yaml
+jobs:
+  build:
+    permissions:
+      contents: read
+      statuses: write # required by ssh-command-status
+    steps:
+      - uses: owenthereal/action-upterm/detached@v2
+        with:
+          limit-access-to-actor: true
+          ssh-command-status: true
+```
+
+The status goes on the run's commit, or the pull request's head commit for a `pull_request` event. Its context is `upterm / <job id>` (set `ssh-command-status-context` per matrix entry, since those share a job id), its link is the workflow run, and it goes through three states:
+
+| State | Description | When |
+|---|---|---|
+| `pending` | `Starting an upterm session` | before anything is downloaded |
+| `pending` | the ssh command, e.g. `ssh abc123@uptermd.upterm.dev` | the session is ready |
+| `success` / `error` | `The upterm session has ended` / `The upterm session could not start` | the post step stopped it / the launch failed |
+
+```bash
+gh api "repos/OWNER/REPO/commits/$SHA/status" \
+  --jq '.statuses[] | select(.context == "upterm / build" and (.description | startswith("ssh "))) | .description'
+```
+
+If the token can't write statuses, the step fails at once, before starting a session nobody could find, and says which permission to add. Updates after the first only warn. If the job is cancelled, the post step doesn't run, and the status keeps showing the last ssh command. With `limit-access-to-actor` or `limit-access-to-users`, knowing the command doesn't let anyone in; without them, anyone who can read the repository's statuses can join, just as anyone who can read the job's log could.
+
 ## Let Scripts and AI Agents Run Commands
 
 A person can drive the shared terminal; a script or an AI agent can't. With `allow-exec`, a guest can instead run one command at a time over SSH, with no terminal, and get back its output and exit status, as from any SSH server:

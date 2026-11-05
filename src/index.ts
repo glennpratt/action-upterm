@@ -24,6 +24,7 @@ import {
   waitStatusLine
 } from './session';
 import {knownHostsFor} from './knownHosts';
+import {SshCommandStatus} from './commitStatus';
 
 // Constants
 const UPTERM_DEFAULT_REPOSITORY = 'owenthereal/upterm';
@@ -366,6 +367,10 @@ function validateInputs(): void {
 }
 
 export async function run() {
+  // ssh-command-status, once its first status is posted; told of a launch
+  // that fails after that.
+  let sshStatus: SshCommandStatus | null = null;
+  let sshStatusReady = false;
   try {
     // wait/action.yml runs this same bundle, as a separate action with no post.
     if (core.getInput('wait-for-session') === 'true') {
@@ -396,11 +401,19 @@ export async function run() {
       return;
     }
 
+    // Before anything is downloaded: posting the first status is the
+    // opt-in's permission check, and it fails the step.
+    const status = SshCommandStatus.forMain();
+    await status?.starting();
+    sshStatus = status;
+
     await installDependencies();
     await assertSupportedUptermVersion();
     await assertAllowExecSupported();
     const continueFilesAtLaunch = snapshotContinueFiles();
     const session = await startUptermSession(allowedUsers);
+    await sshStatus?.ready(session.sshCommand ?? '');
+    sshStatusReady = true;
 
     if (core.getInput('detached') === 'true') {
       await runDetachedMode(session, continueFilesAtLaunch);
@@ -409,6 +422,7 @@ export async function run() {
 
     await waitForSession(connectLines(session), continueFilesAtLaunch);
   } catch (error: unknown) {
+    if (sshStatus && !sshStatusReady) await sshStatus.failed();
     if (error instanceof Error) {
       core.setFailed(error.message);
     } else {
@@ -1310,6 +1324,7 @@ async function finalizeSession(): Promise<void> {
     // XDG_STATE_HOME, which only main had exported so far.
     exportXdgEnvironment();
     await stopSession();
+    await SshCommandStatus.forPost()?.ended();
   }
   cleanupUptermData();
 }
