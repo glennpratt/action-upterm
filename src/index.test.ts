@@ -1573,25 +1573,29 @@ describe('upterm GitHub integration', () => {
     it('with inherit-path, hosts a bash that reads no startup files, so nothing resets PATH', async () => {
       when(core.getInput).calledWith('inherit-path').mockReturnValue('true');
       await run();
-      expect(launchCall()).toMatch(/ -- \/bin\/bash --noprofile --rcfile '[^']*\/config\/session\.bashrc' -i$/);
+      expect(launchCall()).toMatch(/ -- \/bin\/bash --noprofile --norc '[^']*\/config\/session\.sh' '[^']*\/config\/session\.bashrc'$/);
     });
 
-    it("gives that bash the action's rc file in place of ~/.bashrc, which leaves PATH alone and asks before exit ends the session", async () => {
+    it("hosts a loop that restarts the shell, so nothing that ends the shell ends the session, and gives the shell the action's rc file", async () => {
       when(core.getInput).calledWith('inherit-path').mockReturnValue('true');
       await run();
-      const {SESSION_RC} = require('.');
+      const {SESSION_RC, SESSION_LOOP} = require('.');
       expect(mockFs.writeFileSync).toHaveBeenCalledWith(path.join(UPTERM_DATA_DIR, 'config', 'session.bashrc'), SESSION_RC, {mode: 0o600});
+      expect(mockFs.writeFileSync).toHaveBeenCalledWith(path.join(UPTERM_DATA_DIR, 'config', 'session.sh'), SESSION_LOOP, {mode: 0o600});
+      expect(SESSION_LOOP).toContain('set -m');
+      expect(SESSION_LOOP).toContain('/bin/bash --noprofile --rcfile "$1" -i');
       expect(SESSION_RC).not.toMatch(/PATH=/);
-      expect(SESSION_RC).toContain('exit() {');
-      expect(SESSION_RC).toContain('touch "$GITHUB_WORKSPACE/continue"');
-      expect(SESSION_RC).toContain('IGNOREEOF=1');
+      expect(SESSION_RC).toContain('end-session() {');
+      expect(SESSION_RC).toContain('upterm session stop "$UPTERM_SESSION_NAME"');
+      expect(SESSION_RC).toContain('~.            leave');
+      expect(SESSION_RC).toContain('${UPTERM_SESSION_NAME:-}');
     });
 
     it('places --join-timeout before the hosted bash, so bash never sees it', async () => {
       when(core.getInput).calledWith('inherit-path').mockReturnValue('true');
       when(core.getInput).calledWith('wait-timeout-minutes').mockReturnValue('5');
       await run();
-      expect(launchCall()).toMatch(/ --join-timeout 5m -- \/bin\/bash --noprofile --rcfile '[^']*' -i$/);
+      expect(launchCall()).toMatch(/ --join-timeout 5m -- \/bin\/bash --noprofile --norc '[^']*\/session\.sh' '[^']*\/session\.bashrc'$/);
     });
 
     it('hosts default-shell over inherit-path', async () => {

@@ -588,11 +588,11 @@ function getAllowedUsers(): string[] {
  * container images those reset PATH to the system default before the guest's
  * first prompt. Without inherit-path: none, so upterm runs $SHELL.
  */
-function hostedCommand(sessionRcArg: string): string {
+function hostedCommand(sessionLoopArg: string, sessionRcArg: string): string {
   const defaultShell = core.getInput('default-shell').trim();
   if (defaultShell) return ` -- ${shellEscape(defaultShell)}`;
   if (process.platform === 'win32') return ' -- bash -l';
-  if (core.getInput('inherit-path') === 'true') return ` -- /bin/bash --noprofile --rcfile ${shellEscape(sessionRcArg)} -i`;
+  if (core.getInput('inherit-path') === 'true') return ` -- /bin/bash --noprofile --norc ${shellEscape(sessionLoopArg)} ${shellEscape(sessionRcArg)}`;
   return '';
 }
 
@@ -600,31 +600,70 @@ function hostedCommand(sessionRcArg: string): string {
  * What the bash inherit-path hosts reads in place of ~/.bashrc. It sets
  * nothing about PATH, which is the point of not reading the user's.
  *
- * With no tmux, the session's shell is the session: `exit` in it ends the
- * session for everyone, which a guest who only meant to leave would not
- * expect. So whoever is on the screen when the shell starts is told how to end
- * it and how to let the workflow go on without ending it, `exit` asks first,
- * and one stray Ctrl-D only prints bash's own hint. An EOF at the question
- * exits: the terminal has gone.
+ * It tells whoever is on the screen when a shell starts what each way out
+ * does: ssh's ~. leaves and keeps the session, the continue file lets the
+ * workflow go on, and end-session ends the session for everyone. exit and
+ * Ctrl-D only restart the shell (see SESSION_LOOP), so neither can end the
+ * session by accident -- in a shared session, Ctrl-D is what a guest who
+ * means to leave types.
  */
 export const SESSION_RC = `# Written by action-upterm for this session's shell, in place of ~/.bashrc.
 # It leaves PATH as the workflow step had it.
-printf '%s\\n' \\
-  '' \\
-  'This is an upterm session on a GitHub Actions runner.' \\
-  '  exit                                  ends the session for everyone' \\
-  '  touch "$GITHUB_WORKSPACE/continue"    lets the workflow continue; the session stays up' \\
-  ''
-IGNOREEOF=1
-exit() {
+cat <<'UPTERM_MOTD'
+
+This is a shared upterm session on a GitHub Actions runner.
+  ~.            leave: ssh's escape, typed at the start of a line; the session keeps running
+  touch "$GITHUB_WORKSPACE/continue"
+                let the workflow continue: the session stays up until the job ends,
+                or ends now if the job is already at its end
+  end-session   end the session for everyone
+exit and Ctrl-D only restart this shell.
+
+UPTERM_MOTD
+end-session() {
   local reply
-  printf 'exit ends this upterm session for everyone.\\n'
-  read -r -p 'Exit? [y/N] ' reply || reply=y
+  if [ -z "\${UPTERM_SESSION_NAME:-}" ]; then
+    echo 'end-session: UPTERM_SESSION_NAME is not set, so there is no session to end.' >&2
+    return 1
+  fi
+  read -r -p 'This ends the upterm session for everyone. End it? [y/N] ' reply || return 1
   case $reply in
-    [yY]*) builtin exit "$@" ;;
+    [yY]*) upterm session stop "$UPTERM_SESSION_NAME" ;;
+    *) echo 'Not ending the session.' ;;
   esac
-  printf '%s\\n' 'Not exiting. To let the workflow continue and keep the session: touch "$GITHUB_WORKSPACE/continue"'
 }
+`;
+
+/**
+ * The command the session hosts with inherit-path, given SESSION_RC's path.
+ * upterm ends the session when its command exits, so this keeps a shell
+ * running: one that exits -- exit, Ctrl-D, a crash, a kill -- is replaced by a
+ * new one. The session ends deliberately instead: end-session, the post step,
+ * or upterm's join timeout, each of which hangs this up as well.
+ *
+ * A shell that keeps exiting at once -- one that can't start -- ends the
+ * session after five tries rather than spinning.
+ */
+export const SESSION_LOOP = `# Written by action-upterm: the command its upterm session hosts.
+# Job control, so that each shell is given the terminal and the loop takes it
+# back when the shell exits: left with the dead shell's process group, the
+# terminal would leave the next shell in the background, unable to read.
+set -m
+quick=0
+while :; do
+  started=$SECONDS
+  /bin/bash --noprofile --rcfile "$1" -i
+  if [ $((SECONDS - started)) -lt 2 ]; then
+    quick=$((quick + 1))
+    if [ "$quick" -ge 5 ]; then
+      echo 'upterm: the shell keeps exiting as soon as it starts; ending the session.' >&2
+      exit 1
+    fi
+  else
+    quick=0
+  fi
+  printf '\\n%s\\n' 'The shell exited; starting a new one. To end the session for everyone: end-session'
+done
 `;
 
 /**
@@ -770,7 +809,9 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   fs.writeFileSync(path.join(dirs.config, 'known_hosts'), knownHosts + '\n', {mode: 0o600});
   const knownHostsArg = `${xdg.config}/known_hosts`;
   fs.writeFileSync(path.join(dirs.config, 'session.bashrc'), SESSION_RC, {mode: 0o600});
+  fs.writeFileSync(path.join(dirs.config, 'session.sh'), SESSION_LOOP, {mode: 0o600});
   const sessionRcArg = `${xdg.config}/session.bashrc`;
+  const sessionLoopArg = `${xdg.config}/session.sh`;
 
   const auth = await authorizationFlags(allowedUsers, dirs.config, xdg.config);
   // The runner hands this process its inputs as INPUT_* variables, and the
@@ -780,7 +821,7 @@ async function launchSession(uptermServer: string, allowedUsers: string[]): Prom
   // read it, and nothing after the launch does.
   delete process.env['INPUT_GITHUB-TOKEN'];
   // getSessionName() is gha- + 8 hex characters: shell-safe by construction.
-  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${allowExecFlag()}${launchJoinTimeoutFlag()}${hostedCommand(sessionRcArg)}`;
+  const cmd = `upterm host --detach --accept --output json --name ${getSessionName()} --known-hosts ${shellEscape(knownHostsArg)} --server ${shellEscape(uptermServer)}${auth}${allowExecFlag()}${launchJoinTimeoutFlag()}${hostedCommand(sessionLoopArg, sessionRcArg)}`;
 
   core.info(`Creating a new session. Connecting to upterm server ${uptermServer}`);
   // Evidence for the post step that there may be a session to stop. Saved
